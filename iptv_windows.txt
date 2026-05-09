@@ -1,0 +1,603 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+IPTV采集工具 - Windows 适配版
+主要修改：
+1. 移除 fcntl 依赖，使用文件锁替代方案
+2. 修复 Windows 路径问题
+3. 添加调试输出
+"""
+
+import os
+import re
+import requests
+import time
+import concurrent.futures
+from datetime import datetime
+import socket
+import json
+from collections import OrderedDict
+import sys
+import argparse
+import urllib3
+import shutil
+import tempfile
+
+# 禁用 SSL 警告
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# ============ Windows 文件锁实现 ============
+try:
+    import fcntl
+except ImportError:
+    # Windows 下的简单文件锁实现
+    class fcntl:
+        LOCK_EX = 1
+        LOCK_UN = 2
+        LOCK_NB = 4
+        
+        @staticmethod
+        def flock(fd, op):
+            """Windows 下模拟 flock，使用 msvcrt"""
+            try:
+                import msvcrt
+                if op & fcntl.LOCK_EX:  # 获取锁
+                    msvcrt.locking(fd.fileno(), msvcrt.LK_LOCK, 1)
+                elif op & fcntl.LOCK_UN:  # 释放锁
+                    msvcrt.locking(fd.fileno(), msvcrt.LK_UNLCK, 1)
+            except:
+                pass
+    
+    print("[兼容] 已加载 Windows 文件锁补丁")
+
+# ============ 配置 ============
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.getenv("CONFIG_FILE")
+if not CONFIG_FILE:
+    CONFIG_FILE = os.path.join(BASE_DIR, "iptv_config.json")
+OUTPUT_FILE = os.path.join(BASE_DIR, "IPTV.txt")
+
+DEFAULT_THIRD_PARTY_URLS = OrderedDict([
+    ("https://raw.githubusercontent.com/kakaxi-1/IPTV/main/iptv.txt", "source1.txt"),
+    ("https://raw.githubusercontent.com/kakaxi-1/zubo/main/IPTV.txt", "source2.txt"),
+])
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Cache-Control": "max-age=0"
+}
+
+IP_DIR = os.path.join(BASE_DIR, "ip")
+RTP_DIR = os.path.join(BASE_DIR, "rtp")
+WEB_DIR = os.path.join(BASE_DIR, "web")
+
+# 默认配置（简化版，可自定义）
+DEFAULT_CONFIG = OrderedDict([
+    ("categories", OrderedDict([
+        ("央视频道", ["CCTV1", "CCTV2", "CCTV3", "CCTV4", "CCTV5", "CCTV5+", "CCTV6", "CCTV7", "CCTV8", "CCTV9", 
+                      "CCTV10", "CCTV11", "CCTV12", "CCTV13", "CCTV14", "CCTV15", "CCTV16", "CCTV17", "CCTV4K"]),
+        ("卫视频道", ["湖南卫视", "浙江卫视", "江苏卫视", "东方卫视", "深圳卫视", "北京卫视", "广东卫视", "安徽卫视", 
+                      "山东卫视", "天津卫视", "四川卫视", "重庆卫视", "湖北卫视", "江西卫视", "辽宁卫视", "黑龙江卫视"]),
+        ("数字频道", ["凤凰卫视中文台", "凤凰卫视资讯台", "CHC动作电影", "CHC家庭影院", "金鹰纪实", "纪实人文", 
+                      "卡酷少儿", "金鹰卡通", "哈哈炫动", "动漫秀场", "游戏风云"]),
+        ("地方频道", ["安徽卫视", "北京卫视", "东方卫视", "广东卫视", "深圳卫视"])
+    ])),
+    ("mapping", OrderedDict([
+        ("CCTV1", ["CCTV-1", "CCTV-1综合"]),
+        ("CCTV2", ["CCTV-2", "CCTV-2财经"]),
+        ("CCTV3", ["CCTV-3", "CCTV-3综艺"]),
+        ("CCTV4", ["CCTV-4", "CCTV-4中文国际"]),
+        ("CCTV5", ["CCTV-5", "CCTV-5体育"]),
+        ("CCTV6", ["CCTV-6", "CCTV-6电影"]),
+        ("CCTV7", ["CCTV-7", "CCTV-7国防军事"]),
+        ("CCTV8", ["CCTV-8", "CCTV-8电视剧"]),
+        ("CCTV9", ["CCTV-9", "CCTV-9纪录"]),
+        ("CCTV10", ["CCTV-10", "CCTV-10科教"]),
+        ("CCTV11", ["CCTV-11", "CCTV-11戏曲"]),
+        ("CCTV12", ["CCTV-12", "CCTV-12社会与法"]),
+        ("CCTV13", ["CCTV-13", "CCTV-13新闻"]),
+        ("CCTV14", ["CCTV-14", "CCTV-14少儿"]),
+        ("CCTV15", ["CCTV-15", "CCTV-15音乐"]),
+        ("CCTV16", ["CCTV-16", "CCTV-16奥林匹克"]),
+        ("CCTV17", ["CCTV-17", "CCTV-17农业农村"]),
+        ("湖南卫视", ["湖南卫视", "湖南卫视HD"]),
+        ("浙江卫视", ["浙江卫视", "浙江卫视HD"]),
+        ("江苏卫视", ["江苏卫视", "江苏卫视HD"]),
+        ("东方卫视", ["东方卫视", "东方卫视HD"]),
+        ("北京卫视", ["北京卫视", "北京卫视HD"]),
+        ("安徽卫视", ["安徽卫视", "安徽卫视HD"]),
+    ])),
+    ("third_party_urls", DEFAULT_THIRD_PARTY_URLS),
+    ("settings", OrderedDict([
+        ("FFMPEG_MAX_DETECT_TIME", 40),
+        ("FFMPEG_TEST_DURATION", 15),
+        ("RESPONSE_TIME_THRESHOLD", 10),
+        ("STREAM_STABLE_THRESHOLD", 0.5),
+        ("schedules", [
+            {"id": 1, "time": "09:00", "enabled": True},
+            {"id": 2, "time": "12:00", "enabled": True},
+            {"id": 3, "time": "18:00", "enabled": True}
+        ])
+    ]))
+])
+
+# ============ 更新锁（Windows 兼容） ============
+class UpdateLock:
+    def __init__(self):
+        self.lock_file = os.path.join(tempfile.gettempdir(), "iptv_update.lock")
+        self.timeout = 1800
+        self.lock_fd = None
+        
+    def acquire(self, wait=True):
+        """获取锁，Windows 兼容版本"""
+        try:
+            # 检查锁文件是否超时
+            if os.path.exists(self.lock_file):
+                try:
+                    mtime = os.path.getmtime(self.lock_file)
+                    if time.time() - mtime > self.timeout:
+                        os.remove(self.lock_file)
+                except:
+                    pass
+            
+            # 创建锁文件
+            if not wait:
+                if os.path.exists(self.lock_file):
+                    return False
+            
+            # 写入锁信息
+            with open(self.lock_file, 'w') as f:
+                lock_info = {
+                    'pid': os.getpid(),
+                    'time': time.time(),
+                    'hostname': socket.gethostname()
+                }
+                json.dump(lock_info, f)
+            return True
+            
+        except Exception:
+            # 锁失败也继续执行（避免卡死）
+            return True
+    
+    def release(self):
+        """释放锁"""
+        try:
+            if os.path.exists(self.lock_file):
+                os.remove(self.lock_file)
+        except:
+            pass
+
+# ============ 配置管理 ============
+def load_config():
+    """加载配置文件"""
+    config_dir = os.path.dirname(CONFIG_FILE)
+    if config_dir and not os.path.exists(config_dir):
+        os.makedirs(config_dir, exist_ok=True)
+    
+    if not os.path.exists(CONFIG_FILE):
+        save_config(DEFAULT_CONFIG)
+        print(f"[配置] 已创建默认配置文件: {CONFIG_FILE}")
+        return DEFAULT_CONFIG.copy()
+    
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+            if not content:
+                save_config(DEFAULT_CONFIG)
+                return DEFAULT_CONFIG.copy()
+            config_data = json.loads(content)
+        
+        # 确保必要的键存在
+        if "categories" not in config_data:
+            config_data["categories"] = DEFAULT_CONFIG["categories"]
+        if "mapping" not in config_data:
+            config_data["mapping"] = DEFAULT_CONFIG["mapping"]
+        if "third_party_urls" not in config_data:
+            config_data["third_party_urls"] = DEFAULT_CONFIG["third_party_urls"]
+        
+        return config_data
+    except Exception as e:
+        print(f"[错误] 加载配置失败: {e}")
+        return DEFAULT_CONFIG.copy()
+
+
+def save_config(config):
+    """保存配置文件"""
+    try:
+        config_dir = os.path.dirname(CONFIG_FILE)
+        if config_dir and not os.path.exists(config_dir):
+            os.makedirs(config_dir, exist_ok=True)
+        
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2, ensure_ascii=False)
+        return True
+    except Exception as e:
+        print(f"[错误] 保存配置失败: {e}")
+        return False
+
+
+def get_isp_from_api(data):
+    """从API获取运营商"""
+    isp_raw = (data.get("isp") or "").lower()
+    if any(keyword in isp_raw for keyword in ["telecom", "ct", "chinatelecom"]):
+        return "电信"
+    elif any(keyword in isp_raw for keyword in ["unicom", "cu", "chinaunicom"]):
+        return "联通"
+    elif any(keyword in isp_raw for keyword in ["mobile", "cm", "chinamobile"]):
+        return "移动"
+    return "未知"
+
+
+def get_isp_by_regex(ip):
+    """通过IP正则判断运营商"""
+    telecom_segments = r"^(1[0-9]{2}|2[0-3]{2}|27|42|43|58|59|60|61|110|111|112|113|114|115|116|117|118|119|120|121|122|123|124|125|126|127|133|149|153|173|177|180|181|189|190|191|193|199)"
+    unicom_segments = r"^(42|43|58|59|60|61|110|111|112|113|114|115|116|117|118|119|120|121|122|123|124|125|126|127|130|131|132|166|175|176|185|186|196)"
+    mobile_segments = r"^((223|36|37|38|39|100|101|102|103|104|105|106|107|108|109|134|135|136|137|138|139|150|151|152|157|158|159|170|178|182|183|184|187|188|192|195|197|198))"
+
+    if re.match(telecom_segments, ip):
+        return "电信"
+    elif re.match(unicom_segments, ip):
+        return "联通"
+    elif re.match(mobile_segments, ip):
+        return "移动"
+    return "未知"
+
+
+def first_stage():
+    """第一阶段：获取IP和运营商信息"""
+    print("\n[1/3] 正在获取代理IP...")
+    os.makedirs(IP_DIR, exist_ok=True)
+    all_ips = set()
+
+    config = load_config()
+    THIRD_PARTY_URLS = config.get("third_party_urls", DEFAULT_THIRD_PARTY_URLS)
+    
+    for url, filename in THIRD_PARTY_URLS.items():
+        try:
+            print(f"  → 请求: {url}")
+            r = requests.get(url, headers=HEADERS, timeout=15)
+            pattern = r'http[s]?://(([^/:]+(:\d+)?|[0-9]{1,3}(\.[0-9]{1,3}){3}(:\d+)?))[^"\'\s<>]*'
+            matches = re.findall(pattern, r.text)
+            
+            for match in matches:
+                addr = match[0].strip()
+                if addr:
+                    all_ips.add(addr)
+            print(f"    找到 {len(matches)} 个IP")
+        except Exception as e:
+            print(f"    失败: {e}")
+        time.sleep(1)
+    
+    print(f"  共获取 {len(all_ips)} 个唯一IP")
+    
+    if len(all_ips) == 0:
+        print("  ⚠️ 没有找到IP，请检查网络")
+        return
+
+    province_isp_dict = {}
+    count = 0
+    for ip_port in all_ips:
+        try:
+            host = ip_port.split(":")[0]
+            is_ip = re.match(r"^\d{1,3}(\.\d{1,3}){3}$", host)
+            if not is_ip:
+                try:
+                    ip = socket.gethostbyname(host)
+                except Exception:
+                    continue
+            else:
+                ip = host
+
+            try:
+                res = requests.get(f"http://ip-api.com/json/{ip}?lang=zh-CN", timeout=5)
+                if res.status_code != 200:
+                    continue
+                    
+                data = res.json()
+                if data.get("status") != "success":
+                    continue
+
+                province = data.get("regionName", "未知")
+                province = province.replace("省", "").replace("市", "").replace("自治区", "")
+
+                isp = get_isp_from_api(data)
+                if isp == "未知":
+                    isp = get_isp_by_regex(ip)
+
+                if isp == "未知":
+                    continue
+
+                fname = f"{province}{isp}.txt"
+                province_isp_dict.setdefault(fname, set()).add(ip_port)
+                count += 1
+                if count % 50 == 0:
+                    print(f"    已处理 {count}/{len(all_ips)} 个IP")
+                
+            except Exception:
+                continue
+        except Exception:
+            continue
+
+    for filename, ip_set in province_isp_dict.items():
+        path = os.path.join(IP_DIR, filename)
+        with open(path, "w", encoding="utf-8") as f:
+            for ip_port in sorted(ip_set):
+                f.write(ip_port + "\n")
+    
+    print(f"  已保存 {len(province_isp_dict)} 个省份的IP文件")
+    print("[1/3] 第一阶段完成")
+
+
+def second_stage_in_memory():
+    """第二阶段：合并IP和RTP源"""
+    print("\n[2/3] 正在合并IP和RTP源...")
+    combined_lines = []
+    
+    if not os.path.exists(IP_DIR):
+        print("  ⚠️ IP目录不存在")
+        return combined_lines
+    if not os.path.exists(RTP_DIR):
+        print("  ⚠️ RTP目录不存在，请创建 rtp 文件夹并放入源文件")
+        return combined_lines
+
+    config = load_config()
+    mapping = config.get("mapping", {})
+    alias_map = {}
+    for main_name, aliases in mapping.items():
+        for alias in aliases:
+            alias_map[alias] = main_name
+
+    ip_files = [f for f in os.listdir(IP_DIR) if f.endswith(".txt")]
+    rtp_files = [f for f in os.listdir(RTP_DIR) if f.endswith(".txt")]
+    
+    print(f"  IP文件: {ip_files}")
+    print(f"  RTP文件: {rtp_files}")
+
+    for ip_file in ip_files:
+        ip_path = os.path.join(IP_DIR, ip_file)
+        
+        # 尝试匹配同名或相似的RTP文件
+        for rtp_file in rtp_files:
+            rtp_path = os.path.join(RTP_DIR, rtp_file)
+            
+            try:
+                with open(ip_path, encoding="utf-8") as f1:
+                    ip_lines = [x.strip() for x in f1 if x.strip()]
+                with open(rtp_path, encoding="utf-8") as f2:
+                    rtp_lines = [x.strip() for x in f2 if x.strip()]
+                
+                print(f"  处理: {ip_file} + {rtp_file} (IP:{len(ip_lines)}, 频道:{len(rtp_lines)})")
+                
+                for ip_port in ip_lines[:1000]:  # 限制每个文件最多测试10个IP
+                    for rtp_line in rtp_lines:
+                        if "," not in rtp_line:
+                            continue
+                        ch_name, rtp_url = rtp_line.strip().split(",", 1)
+                        ch_main = alias_map.get(ch_name, ch_name)
+                        
+                        if "rtp://" in rtp_url:
+                            part = rtp_url.split("rtp://", 1)[1]
+                            full_url = f"{ch_main},http://{ip_port}/rtp/{part}"
+                            combined_lines.append(full_url)
+            except Exception as e:
+                print(f"    处理失败: {e}")
+                continue
+
+    # 去重
+    unique_lines = {}
+    for line in combined_lines:
+        if "," not in line:
+            continue
+        ch_main, url = line.split(",", 1)
+        if url not in unique_lines:
+            unique_lines[url] = line
+    
+    result = list(unique_lines.values())
+    print(f"  生成 {len(result)} 个候选链接")
+    return result
+
+
+def check_ip_stream_speed(ip_port, test_url, max_duration=7, target_speed=900):
+    """检测IP流速度"""
+    try:
+        start_time = time.time()
+        total_downloaded = 0
+        
+        with requests.get(test_url, stream=True, timeout=max_duration+5, headers=HEADERS, verify=False) as r:
+            if r.status_code != 200:
+                return False, 0
+            
+            for chunk in r.iter_content(chunk_size=8192):
+                if chunk:
+                    total_downloaded += len(chunk)
+                    elapsed = time.time() - start_time
+                    if elapsed > 0:
+                        current_speed = (total_downloaded / 1024) / elapsed
+                        if current_speed >= target_speed:
+                            return True, current_speed
+                    if elapsed >= max_duration:
+                        break
+        return False, 0
+    except Exception:
+        return False, 0
+
+
+def detect_ip_channels(ip_port, entries):
+    """检测IP下的频道"""
+    test_url = None
+    channel_list = []
+    
+    for ch_main, url in entries:
+        channel_list.append((ch_main, url))
+        if ch_main == "湖南卫视" or "湖南卫视" in ch_main:
+            test_url = url
+            break
+    
+    if not test_url:
+        for ch_main, url in entries:
+            if "卫视" in ch_main:
+                test_url = url
+                break
+    
+    if not test_url and entries:
+        test_url = entries[0][1]
+    
+    if not test_url:
+        return ip_port, False, 0, []
+    
+    is_valid, speed = check_ip_stream_speed(ip_port, test_url)
+    
+    if is_valid:
+        return ip_port, True, speed, channel_list
+    return ip_port, False, 0, []
+
+
+def third_stage_enhanced():
+    """第三阶段：生成最终播放列表"""
+    print("\n[3/3] 正在生成播放列表...")
+    
+    lines = second_stage_in_memory()
+    if not lines:
+        print("  ⚠️ 没有可用链接")
+        return
+    
+    config = load_config()
+    categories_config = config.get("categories", {})
+    
+    # 按IP分组
+    groups = {}
+    for line in lines:
+        if "," not in line:
+            continue
+        ch_main, url = line.strip().split(",", 1)
+        m = re.match(r"http://(\d+\.\d+\.\d+\.\d+:\d+)/", url)
+        if m:
+            ip_port = m.group(1)
+            groups.setdefault(ip_port, []).append((ch_main, url))
+    
+    print(f"  待测试IP数: {len(groups)}")
+    
+    # 并发测试
+    valid_results = []
+    max_workers = 3
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(detect_ip_channels, ip, chs): ip for ip, chs in groups.items()}
+        
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                ip_port, ip_is_valid, speed, channel_list = future.result()
+                if ip_is_valid and channel_list:
+                    valid_results.append({
+                        'ip': ip_port,
+                        'speed': speed,
+                        'channels': channel_list
+                    })
+                    print(f"    ✓ {ip_port} 有效 (速度: {speed:.0f}KB/s)")
+                else:
+                    print(f"    ✗ {future.result()[0]} 无效")
+            except Exception as e:
+                continue
+    
+    valid_results.sort(key=lambda x: x['speed'], reverse=True)
+    print(f"  有效IP数: {len(valid_results)}")
+    
+    # 收集频道URL
+    channel_urls = OrderedDict()
+    for item in valid_results:
+        for ch_main, url in item['channels']:
+            if ch_main not in channel_urls:
+                channel_urls[ch_main] = []
+            channel_urls[ch_main].append(url)
+    
+    # 去重
+    for ch_main in channel_urls:
+        channel_urls[ch_main] = list(OrderedDict.fromkeys(channel_urls[ch_main]))
+    
+    # 生成输出文件
+    try:
+        with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            f.write(f"更新时间,#genre#\n")
+            f.write(f"{now_str},url\n")
+            
+            for category, channel_list in categories_config.items():
+                if channel_list:
+                    f.write(f"\n{category},#genre#\n")
+                    for channel_name in channel_list:
+                        if channel_name in channel_urls and channel_urls[channel_name]:
+                            for url in channel_urls[channel_name][:3]:  # 每个频道最多3个源
+                                f.write(f"{channel_name},{url}\n")
+        
+        print(f"\n✅ 播放列表已生成: {OUTPUT_FILE}")
+        
+        # 统计
+        total_channels = sum(1 for cat in categories_config.values() for ch in cat if ch in channel_urls and channel_urls[ch])
+        print(f"  有效频道数: {total_channels}")
+        
+    except Exception as e:
+        print(f"  ❌ 写入失败: {e}")
+
+
+def init_environment():
+    """初始化环境"""
+    for dir_path in [IP_DIR, RTP_DIR, WEB_DIR]:
+        os.makedirs(dir_path, exist_ok=True)
+        print(f"  确保目录: {dir_path}")
+    
+    config = load_config()
+    return config
+
+
+def run_update():
+    """执行更新流程"""
+    print("=" * 60)
+    print("IPTV 采集工具 (Windows 版)")
+    print("=" * 60)
+    
+    lock = UpdateLock()
+    if not lock.acquire(wait=False):
+        print("已有更新任务在运行，跳过")
+        return 0
+    
+    try:
+        config = init_environment()
+        
+        if not os.path.exists(RTP_DIR) or not any(f.endswith('.txt') for f in os.listdir(RTP_DIR)):
+            print("\n⚠️ 提示: rtp 目录为空!")
+            print("请在 rtp 文件夹中放入组播源文件，格式如:")
+            print("  湖南卫视,rtp://239.76.253.50:5140")
+            print("  CCTV1,rtp://239.93.0.28:5140")
+        
+        first_stage()
+        third_stage_enhanced()
+        
+        print("\n" + "=" * 60)
+        print("✅ 更新完成!")
+        print("=" * 60)
+        return 0
+        
+    except Exception as e:
+        print(f"\n❌ 错误: {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
+    finally:
+        lock.release()
+
+
+def main():
+    parser = argparse.ArgumentParser(description='IPTV采集工具 (Windows版)')
+    parser.add_argument('--manual', action='store_true', help='手动更新模式')
+    args = parser.parse_args()
+    
+    return run_update()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
